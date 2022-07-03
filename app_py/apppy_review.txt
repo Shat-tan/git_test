@@ -1,0 +1,154 @@
+import ssl
+import sys
+import hashlib
+import logging
+import signal
+import yaml
+import sqlalchemy
+
+import jinja2
+import werkzeug.serving
+from flask import Flask
+
+from common import *
+from main import *
+from main_admins import *
+from main_users import *
+
+
+
+app = Flask(__name__)
+
+app.url_map.strict_slashes = False
+
+
+
+app.secret_key = hashlib.sha256(b'ahrlskfkdpdkfghdtnrkwhgdmsrk' + \
+	read_bytes(CERT_AND_KEY_PATHS[1])).digest()
+
+													# config.yml에서 참조
+app.config['SQLALCHEMY_DATABASE_URI'] = config['DATABASE_URI']			# DB URL	'mysql://yuna:yuna88@localhost/father_recipe'	
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False				# Ture하면 Warring메시지 유발
+app.config['MAX_CONTENT_LENGTH'] = config['MAX_CONTENT_LENGTH']		# 업로드허용량? 1073741824 1GB
+app.config['DEFAULT_LOCALE'] = config['DEFAULT_LOCALE']				# ko
+
+Flask.jinja_options['autoescape'] = True				/ HTML 이스케이프 처리 (&, &amp;)
+#app.logger.setLevel(logging.DEBUG)					/ 로그인 레벨 상세한 정보.
+
+
+if os.path.dirname(__file__).endswith('pexe.res'):			/os모듈 os.path 모듈,dir name 함수는 폴더의 입력 경로의 폴더경로까지 꺼내주고, 그문자열의 마지막이 pexe.res이면 트루, 아니면 펄스
+	app.root_path = MODULE_DIR					/가져온 이름 끝이 *pexe.res 이면 app.root_path = MODULE_DIR
+	Flask.jinja_options['loader'] = jinja2.ModuleLoader(MODULE_DIR + '/pexe.res/templates')		/ jinja2.ModuleLoader(MODULE_DIR +...
+
+
+def sigchld_handler(code, frame):			/ 시그널 핸들러, 프로세스 종료와 재시작/ sigchld 시그널 번호를 받아 소켓 디스크립터에 기록 / 시그널핸들링 신호처리
+	pid = None
+	try:
+		(pid, sts) = os.waitpid(-1, os.WNOHANG)
+	except ChildProcessError:
+		sts = 0
+	return (pid, sts)
+	
+signal.signal(signal.SIGCHLD, sigchld_handler)
+
+
+
+
+db.init_app(app)			/ DB생성 옵션 유저 리로드?
+options = {'use_reloader': False}
+for arg in sys.argv:
+	if arg == '--debug':
+		options['debug'] = True
+		arg = '--reload'
+	if arg == '--reload':
+		options['use_reloader'] = True
+		# This should be done before register_blueprint() or tag.init_app()
+		app.config['TEMPLATES_AUTO_RELOAD'] = True
+
+for prefix in ['/', '/<locale>']:					#### Route?
+	app.register_blueprint(main, url_prefix = prefix)
+
+
+
+
+init_app(app)			/ 디비생성? 관리자, ip 등록 등등 인듯
+for i, arg in enumerate(sys.argv):
+	def check_ip_addr(*ips):
+		for ip in ips:
+			if not is_valid_ip_addr(ip): print(f'"{ip}"는 IP 주소가 아닙니다. IP 주소로 입력해주세요. ex) xxx.xxx.xxx.xxx'); sys.exit(0)
+
+	if arg == '--api-key':
+		print("VMM_CERT_HOST_NAME: '%s'" % VMM_CERT_HOST_NAME)
+		print("VMM_API_KEY: '%s'" % VMM_API_KEY)
+		sys.exit(0)
+	elif arg == '--list-url-map':
+		print(app.url_map)
+		sys.exit(0)
+	if arg == '--compile-templates':
+		app.jinja_env.compile_templates(sys.argv[i + 1], zip = None)
+		sys.exit(0)
+	elif arg == '--init':
+		def print_error():
+			print("다음과 같은 구조로 입력해주세요.")
+			print("--init [admin_password] [pc_ip]")
+			print("\tadmin_password: 관리자 비밀번호")
+			print("\tpc_ip: 관리 서버에 등록할 현재 PC IP")
+		args_index = {'admin_password': 2, 'vmm_pc_ip': 3}
+		with app.app_context():
+			if len(sys.argv) > 3:
+				admin_password, pc_ip = [sys.argv[args_index[index]] for index in args_index.keys()]
+				check_ip_addr(pc_ip)
+				init(admin_password, pc_ip)
+			else: print_error()
+
+		sys.exit(0)
+	elif arg == '--migrate-db':
+		with app.app_context():
+			if len(sys.argv) > 2: migrate_db(vmm_app_file_name=sys.argv[2])
+			else: migrate_db()
+		sys.exit(0)
+	elif arg == '--set-config':
+		if len(sys.argv) > 3:
+			load_config()
+			key, value = sys.argv[2], sys.argv[3]
+			config[key] = value
+			if value.lower() == 'true': config[key] = True
+			elif value.lower() == 'false': config[key] = False
+			save_config()
+		else:
+			print(f"다음과 같은 구조로 입력해주세요.")
+			print("--set-config [key] [value]")
+			print("\tkey: config 파일에 저장할 키")
+			print("\tvalue: config 파일에 저장할 값")
+		sys.exit(0)
+
+if options['use_reloader']:
+	start_locale_reloader()
+
+if options['use_reloader']:
+	import werkzeug._reloader
+	def new_trigger_reload(self, filename):
+		self.log_reload(filename)
+		sys.exit(3)
+	werkzeug._reloader.ReloaderLoop.trigger_reload = new_trigger_reload
+else:
+	def on_signal(code, frame):
+		raise KeyboardInterrupt()
+	signal.signal(signal.SIGTERM, on_signal)
+	signal.signal(signal.SIGINT, on_signal)
+
+
+
+
+with app.app_context():		/ 어플리케이션 컨텍스트
+	try:
+		if not options['use_reloader'] or werkzeug.serving.is_running_from_reloader():
+			load_setting()
+			setting = get_setting()
+		ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLSv1_2)
+		ssl_ctx.set_ciphers(CIPHERS)
+		ssl_ctx.load_cert_chain(*CERT_AND_KEY_PATHS)
+		app.run('0.0.0.0', port = PORT, ssl_context = ssl_ctx, threaded = True, **options)
+	except Exception as e:
+		print(e)
+		pass

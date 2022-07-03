@@ -1,0 +1,5 @@
+from flask import Flask		/ flask 라는 패키지에 Flask 모듈을 Import
+
+app = Flask(name) 			/ Flask 인스턴스를 생성.
+
+app.url_map.strict_slashes = False

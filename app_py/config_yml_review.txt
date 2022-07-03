@@ -1,0 +1,15 @@
+PORT: 7878
+
+CERT_PATH: 'aav_vmm.cert'
+KEY_PATH: 'aav_vmm_decrypted.key'
+CA_CERTS_PATH: 'ca_certs.pem'
+
+DATABASE_URI: 'mysql://yuna:yuna88@localhost/father_recipe'
+
+DEFAULT_LOCALE: 'ko'
+
+MAX_CONTENT_LENGTH: 1073741824			# 1GB
+
+ADMIN_RANGE_OF_IP_ADDR_COUNT: '1-2'		/????
+
+MIN_ADMIN_LOGIN_INACTIVATE_TIME: 300		/ 300초 뒤에 로그아웃

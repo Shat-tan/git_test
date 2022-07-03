@@ -1,0 +1,7 @@
+yaml
+sqlalchemy
+
+jinja2
+werkzeug.serving
+
+flask

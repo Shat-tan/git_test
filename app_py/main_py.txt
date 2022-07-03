@@ -1,0 +1,567 @@
+import io
+import os
+import time
+import re
+import hashlib
+import hmac
+import traceback
+import collections
+import datetime
+import smtplib
+from email.mime.text import MIMEText
+
+import tag
+
+from flask.blueprints import Blueprint # Currently pytype fails if Blueprint is imported from flask.
+from flask import Response, Markup, escape, request, session, abort, g, \
+	flash, get_flashed_messages, redirect, url_for, render_template, send_file, jsonify, \
+	current_app as app
+from sqlalchemy.orm import contains_eager, joinedload, load_only
+
+from common import *
+from i18n import *
+from record import *
+from models import *
+
+main = Blueprint('main', __name__, url_prefix = '/<locale>')
+
+@main.app_template_filter()
+def yes_no(v):
+    return t('yes') if v else t('no')
+@main.app_template_filter()
+def unix_ts(v):
+	return l(datetime.datetime.fromtimestamp(v))
+@main.app_template_filter()
+
+@main.before_app_first_request
+def before_first_request():
+	load_setting()
+
+def flash_success(msg): flash(msg, 'success')
+def flash_failure(msg): flash(msg, 'failure')
+
+@main.before_request
+def before_request():
+	g.endpoint = request.endpoint.replace('main.', '')
+	g.locale = locale = request.view_args.pop('locale',  None)
+	mdm_endpoints = ['command', 'check_in', 'checkin', 'install_cert', 'install_payload', 'get_request_payload', 'get_response_payload']
+	if g.endpoint == 'index': return
+	if g.endpoint in mdm_endpoints: return
+	if locale and locale not in get_locales(): abort(HTTP_NOT_FOUND)
+	set_locale(locale or \
+		request.accept_languages.best_match(get_locales()) or \
+		app.config['DEFAULT_LOCALE'])
+	if not g.locale: g.locale = app.config['DEFAULT_LOCALE']
+
+	expire_time, now = session.get('expire_time'), int(time.time())
+	if expire_time and now > expire_time:
+		after_logout()
+		flash_failure(t('access_denied'))
+	# TODO: optimize implementing a server side session storage
+	# (The default storage is a client side cookie. So the following causes sending the entire cookie on every request.)
+	session['expire_time'] = now + get_setting().session_life_in_sec
+	g.setting = get_setting()
+
+	admin_id = session.get('admin_id')
+	g.current_admin = Admin.query.options(joinedload('user')).get(admin_id) if admin_id is not None else None
+
+	try:
+		is_post = request.method == 'POST'
+		# You can't use the endpoint because a controller or action name can contain '_'.
+		# names: optional parent names, controller name, optional id, action name
+		names = [name for name in request.path.split('/') if name and not is_valid_int(name)]
+		if g.endpoint.endswith('_index'): names.append('index')
+		elif g.endpoint.endswith('_show'): names.append('show')
+		g.action = action = names[-1]
+		g.controller = names[-2]
+		#print(g.action, g.controller)
+		if g.controller == 'account':
+			g.model = None
+			if g.action == 'edit' or g.action == 'update':
+				g.model = plural_to_model("admins")
+				if session.get('change_password_admin_id', None):
+					g.current_admin = Admin.query.options(joinedload('user')).get(session['change_password_admin_id'])
+		else: g.model = plural_to_model(g.controller)
+		g.subaction = request.form.get('subaction') if is_post else request.args.get('subaction')
+		g.parent = None # This should be assigned in a controller function
+		g.is_permitted = is_permitted()
+		if not g.is_permitted:
+			#flash_failure(t('access_denied'))
+			if not is_logged_in():
+				path = request.full_path
+				session['path_after_login'] = path[1 + len(locale):] if locale else path
+				return redirect(url_for('.account_login'))
+			else:
+				return redirect(request.referrer)
+		elif is_logged_in() and session.get('admin_id') and g.setting.multi_login_disabled:
+			if session.get('csrf_token') != g.current_admin.csrf_token:
+				send_email(t('email.logout_multi_limit'), 'multi_login_admin', name=g.current_admin.user.name)
+				after_logout(); flash_failure(t('errors.multiple_login'))
+				return redirect(url_for('.account_login'))
+		if is_post and g.endpoint not in ('account_login', 'account_edit'):
+			if session.get('csrf_token', None):
+				csrf_token = request.form.get('csrf_token')
+				if session['csrf_token'] != csrf_token: abort(HTTP_UNAUTHORIZED)
+	except (KeyError, IndexError, TypeError, ValueError):
+		#traceback.print_exc()
+		abort(HTTP_BAD_REQUEST)
+
+@main.url_defaults
+def url_defaults(endpoint, values):
+	if g.locale: values['locale'] = g.locale
+
+def is_logged_in():
+	return g.current_admin is not None
+
+def is_super_admin():
+	return g.current_admin.is_super
+
+def can_index(model):
+	if not is_logged_in(): return False
+	return True
+def can_create(model):
+	if not is_logged_in(): return False
+	if not is_super_admin(): return False
+	return True
+def can_update(obj, attr = None):
+	if not is_logged_in(): return False
+	if not is_super_admin(): return False
+	if attr: return attr in get_permitted_attrs(obj)
+	return True
+def can_bulkupdate(model):
+	if not is_logged_in(): return False
+	if not is_super_admin(): return False
+	return True
+def can_destroy(obj):
+	if not is_logged_in(): return False
+	if not is_super_admin(): return False
+	return True
+def get_permitted_attrs(obj):
+	if not can_update(obj): return set()
+	if isinstance(obj, Setting):
+		return {'session_life_in_sec', 'records_per_page', 'use_user_lock', 'max_login_fail_count', 'multi_login_disabled', 'account_inactivate_time', 'changed_password_time'}
+	elif isinstance(obj, Admin):
+		return {'desc', 'user_id', 'is_super', 'ip_addrs', 'csrf_token', 'login_failed_count', 'login_failed_at'}
+	elif isinstance(obj, User):
+		return {'name', 'password', 'password_confirmation', 'is_locked', 'login_fail_count', 'desc', 'password_changed_at'}
+	return set()
+# attrs: a werkzeug MultiDict
+def converted_form_attrs_items(attrs):
+	for k, v in dict.items(attrs):
+		if k.endswith('[]'): yield k[:-2], v
+		else: yield k, v[0]
+def convert_form_attrs(attrs):
+	return {k: v for k, v in converted_form_attrs_items(attrs)}
+def get_permitted_form_attrs(obj):
+	permitted_attrs = get_permitted_attrs(obj)
+	attrs = {k: v for k, v in converted_form_attrs_items(request.form) if k in permitted_attrs}
+	if request.files:
+		attrs.update({k: v[0] for k, v in dict.items(request.files) if k in permitted_attrs})
+	return attrs
+
+def find_obj_of_request():
+	id = request.view_args['id']
+	return g.model.query.get(id)
+def is_permitted():
+	if g.controller == 'account': return True
+	if not is_logged_in(): return False
+	return True
+
+def get_default_url_after_login():
+	return url_for('.admins_index')
+def get_url_after_login():
+	path = session.get('path_after_login', None)
+	if not path: return get_default_url_after_login()
+	return '/%s%s' % (get_locale(), path)
+def after_login(admin):
+	g.current_admin = admin
+	session['admin_id'] = admin.id
+	admin.csrf_token = session['csrf_token'] = hmac.new(app.secret_key, os.urandom(16), hashlib.sha1).hexdigest()
+	db.session.commit()
+def after_logout():
+	g.current_admin = None
+	session.clear()
+
+def get_action_desc(action, model = None):
+	kwargs = {}
+	model = model or g.model
+	if model:
+		kwargs['model'] = t('models.%s.one' % model.singular)
+		if action == 'index' or action == 'bulkupdate':
+			kwargs['models'] = t('models.%s.other' % model.singular)
+	return t('action.' + action, **kwargs)
+def get_attr_desc(attr, model = None):
+	return t('models.%s.%s' % ((model or g.model).singular, attr))
+
+def url_for_action(action, objs, subaction = None):
+	objs = to_iterable(objs or g.model)
+	assert(action in {'index', 'new', 'show', 'edit', 'destroy'})
+	names = []; kwargs = {}
+	for obj in objs[:-1]:
+		name = type(obj).singular; kwargs['%s_id' % name] = obj.id
+		names.append(name)
+	obj = objs[-1]
+	if action in ('index', 'new'): name = obj.plural
+	else:
+		name = type(obj).plural;
+		try: kwargs['id'] = obj.id
+		except: kwargs['id'] = 1
+	names.append(name)
+	return url_for('.%s_%s' % ('_'.join(names), action), subaction = subaction, **kwargs)
+
+# objs: model or [..., grand parent, parent, model]
+def url_for_index(objs = None, subaction = None): return url_for_action('index', objs, subaction)
+# objs: model or [..., grand parent, parent, model]
+def url_for_new(objs = None): return url_for_action('new', objs)
+# objs: a instance or [..., grand parent, parent, instance]
+def url_for_show(objs = None): return url_for_action('show', objs)
+# objs: a instance or [..., grand parent, parent, instance]
+def url_for_edit(objs = None): return url_for_action('edit', objs)
+# objs: a instance or [..., grand parent, parent, instance]
+def url_for_destroy(objs = None): return url_for_action('destroy', objs)
+
+# objs: model or [..., grand parent, parent, model]
+def link_to_index(objs = None, **kwargs):
+	objs = to_iterable(objs or g.model)
+	model = objs[-1]
+	if not can_index(model): return ''
+	return tag.link_to(get_action_desc('index', model), url_for_index(objs), **kwargs)
+
+# objs: a instance or [..., grand parent, parent, instance]
+def link_to_show(objs, text = None, **kwargs):
+	objs = to_iterable(objs)
+	model = type(objs[-1])
+	if not can_index(model): return ''
+	return tag.link_to(text or get_action_desc('show', model), url_for_show(objs), **kwargs)
+
+# objs: model or [..., grand parent, parent, model]
+def link_to_new(objs = None, **kwargs):
+	objs = to_iterable(objs or g.model)
+	model = objs[-1]
+	if not can_create(model): return ''
+	return tag.link_to(get_action_desc('new', model), url_for_new(objs), **kwargs)
+
+# objs: a instance or [..., grand parent, parent, instance]
+def link_to_edit(objs, text = None, **kwargs):
+	objs = to_iterable(objs)
+	obj = objs[-1]
+	if not can_update(obj): return ''
+	return tag.link_to(text or t('edit'), url_for_edit(objs), **kwargs)
+
+# objs: a instance or [..., grand parent, parent, instance]
+def link_to_destroy(objs, text = None, cls = None, confirm_msg = None, **kwargs):
+	cls = 'btn btn-primary' + (' ' + cls if cls else '')
+	objs = to_iterable(objs)
+	obj = objs[-1]
+	if confirm_msg: confirm_msg += '\\n' + get_action_confirm_desc('destroy')
+	else: confirm_msg = get_action_confirm_desc('destroy')
+	if not can_destroy(obj): return ''
+	return tag.link_to(text or t('destroy'), url_for_destroy(objs), cls = cls,
+		post = {'confirm': confirm_msg}, **kwargs)
+
+def page_links(pages):
+	lis = []
+	def add_li(content): lis.append(tag.content_tag('li', content, cls = 'page-item mr-1'))
+	def add_link_to_page(text, page):
+		# args = request.args.copy(); args['page'] = page; args.update(request.view_args); url = url_for(request.endpoint, **args)
+		q = request.query_string.decode('utf-8'); m = re.search(r'\bpage=\d+', q)
+		url = '%s?%s' % (request.path, '%spage=%d%s' % (q[:m.start()], page, q[m.end():]) if m else '%s&page=%d' % (q, page))
+		add_li(tag.link_to(text, url, cls = 'page-link'))
+	if pages.prev: add_link_to_page(t('page.previous'), pages.prev)
+	for page in pages:
+		if page is None: add_li(t('page.none'))
+		else: add_link_to_page(page, page)
+	if pages.next: add_link_to_page(t('page.next'), pages.next)
+	return tag.content_tag('nav', tag.content_tag('ul', Markup(''.join(lis)), cls = 'pagination justify-content-center'))
+
+def get_action_title(with_link = True):
+	action = g.action
+	if action == 'create': action = 'new'
+	elif action == 'update': action = 'edit'
+	desc = get_action_desc(action)
+	parent = g.parent
+	if parent:
+		if isinstance(parent, CnVmm): parent_name = parent.internal_host_name
+		else: parent_name = parent.name
+		if with_link: parent_desc = link_to_show(parent, text = parent_name)
+		else: parent_desc = escape(parent_name)
+		subaction = g.subaction
+		if subaction:
+			desc = Markup(t(subaction, parent_desc = parent_desc))
+		else:
+			desc = Markup(t('action_desc_of_child', action_desc = escape(desc), parent_desc = parent_desc))
+	return desc
+
+def get_action_success_desc():
+	assert(g.action not in ('index', 'show'))
+	return t('action.success', action = get_action_desc(g.action))
+def get_action_failure_desc():
+	assert(g.action not in ('index', 'show'))
+	return t('action.failure', action = get_action_desc(g.action))
+def get_action_confirm_desc(action):
+	assert(action not in ('index', 'show'))
+	return t('action.confirm', action = get_action_desc(action))
+def flash_action_success(): flash_success(get_action_success_desc())
+def flash_action_failure(error = None):
+	msg = get_action_failure_desc()
+	if error: msg = Markup('%s<br><small>(%s)</small>' % (escape(msg), escape(error)))
+	flash_failure(msg)
+
+class FormFor:
+	# See form_for() macro in templates/app.html.j2
+	# obj: Record or Conditions like object
+	def __init__(self, obj):
+		self.obj = obj
+		assert(isinstance(obj, (Record, Conditions)))
+		self.model = type(obj) if isinstance(obj, Record) else g.model
+		self.multipart = False
+	def get_input_id(self, attr, extra = None):
+		tokens = [self.model.singular, attr]
+		if extra: tokens.append(extra)
+		return '_'.join(tokens)
+	# value: This is for a radio button.(This is compared to the value argument of radio())
+	def label(self, attr, value = None, cls = None, **kwargs):
+		cls = 'col-form-label' + (' ' + cls if cls else '')
+		for_ = self.get_input_id(attr, value)
+		if attr.endswith('[]'): attr = attr[:-2]
+		return tag.label(get_attr_desc(attr, model = self.model), for_ = for_, cls = cls, **kwargs)
+	def tag_with_errors(self, tag_func, attr, *args, **kwargs):
+		msgs = []
+		if isinstance(self.obj, Record):
+			for attr_, msg in self.obj.errors:
+				if attr_ == attr: msgs.append(msg)
+		if msgs:
+			cls = kwargs.get('cls')
+			kwargs['cls'] = 'is-invalid' + (' ' + cls if cls else '')
+		return tag_func(attr, *args, **kwargs) + \
+			(tag.content_tag('div', Markup('<br>').join(msgs), cls = 'invalid-feedback') if msgs else '')
+	def input(self, attr, **kwargs):
+		id = self.get_input_id(attr)
+		return self.tag_with_errors(tag.input, attr, getattr(self.obj, attr), id = id, **kwargs)
+	def number(self, attr, **kwargs):
+		id = self.get_input_id(attr)
+		return self.tag_with_errors(tag.number, attr, getattr(self.obj, attr), id = id, **kwargs)
+	def password(self, attr, **kwargs):
+		id = self.get_input_id(attr)
+		return self.tag_with_errors(tag.password, attr, id = id, **kwargs)
+	def checkbox(self, attr, text = None, from_check = 0, **kwargs):
+		id = self.get_input_id(attr)
+		# A hidden input with value '0' should be located after the checkbox input.
+		# (The first one of the multiple values of the same key is used, unlike Rails.
+		#  See get_permitted_form_attrs().)
+		checkbox_markup = self.tag_with_errors(tag.checkbox, attr, int(getattr(self.obj, attr)), \
+			text = text, id = id, **kwargs) + tag.hidden(attr, 0)
+		if from_check == 1: checkbox_markup = tag.content_tag('div', checkbox_markup, cls = 'form-check')
+		return checkbox_markup
+	def radio(self, attr, value, **kwargs):
+		id = self.get_input_id(attr, value)
+		return self.tag_with_errors(tag.radio, attr, getattr(self.obj, attr) == value, value, id = id, **kwargs)
+	def file(self, attr, **kwargs):
+		self.multipart = True
+		id = self.get_input_id(attr)
+		return self.tag_with_errors(tag.file, attr, id = id, **kwargs)
+	def multi_file(self, attr, **kwargs):
+		self.multipart = True
+		id = self.get_input_id(attr)
+		return self.tag_with_errors(tag.multi_file, attr, id = id, **kwargs)
+	def textarea(self, attr, **kwargs):
+		id = self.get_input_id(attr)
+		return self.tag_with_errors(tag.textarea, attr, getattr(self.obj, attr), id = id, **kwargs)
+	# option_text_value_args: either [(text, value), ...] or [text(which is the same as the value), ...]
+	def select(self, attr, option_text_value_args, **kwargs):
+		id = self.get_input_id(attr)
+		option_tags = tag.options_for_select(option_text_value_args, getattr(self.obj, attr))
+		return self.tag_with_errors(tag.select, attr, option_tags, id = id, **kwargs)
+	def collection_select(self, attr, option_objs, value_attr, text_attr, include_blank = None, **kwargs):
+		id = self.get_input_id(attr)
+		obj_value = getattr(self.obj, attr)
+		option_tags = tag.options_from_collection_for_select(option_objs, value_attr, text_attr, obj_value)
+		if include_blank is not None:
+			option_tags = tag.option(include_blank, None, obj_value is None) + option_tags
+		return self.tag_with_errors(tag.select, attr, option_tags, id = id, **kwargs)
+	def collection_checkbox(self, attr, option_objs, value_attr, text_attr, include_blank = None, **kwargs):
+		id = self.get_input_id(attr)
+		obj_value = getattr(self.obj, attr)
+		option_tags = tag.checkbox_from_collection_for_list(option_objs, text_attr, attr, obj_value)
+		return tag.content_tag('div', option_tags, cls = 'form-check form-check-style')
+
+	def submit(self, cls = None, **kwargs):
+		action = g.action if isinstance(self.obj, Record) else 'find'
+		if action == 'new': action = 'create'
+		elif action == 'edit': action = 'update'
+		return tag.button(get_action_desc(action, model = self.model), cls = cls, **kwargs)
+	# TODO: file, date, time, ...
+	# action: not a controller action but an action url of a form tag
+	def render(self, content, action = None, cls = None, **kwargs):
+		if isinstance(self.obj, Conditions):
+			method = 'get'
+		else:
+			method = 'post'
+			csrf_token = session.get('csrf_token')
+			if csrf_token: content += tag.hidden('csrf_token', csrf_token)
+		if not action:
+			def url_for_new_action(new_action):
+				return url_for(request.endpoint[:-len(g.action)] + new_action, **request.view_args)
+			if g.action == 'new': action = url_for_new_action('create')
+			elif g.action == 'edit': action = url_for_new_action('update')
+		if self.multipart: kwargs['enctype'] = 'multipart/form-data'
+		if g.action == 'create' or g.action == 'new' or g.action == 'edit' or g.action == 'update': cls = 'form'
+		return tag.content_tag('form', content, method = method, action = action, cls=cls,**kwargs)
+
+def render(action = None, **kwargs):
+	notice = ''
+	title = ''
+	for category, msg in get_flashed_messages(with_categories = True):
+		notice = tag.alert(msg, cls = {'success': 'alert-success', 'failure': 'alert-danger m-0'}[category])
+	content_template = '%s/%s.html.j2' % (g.controller, action or g.action)
+	title = get_action_title()
+	return render_template('app.html.j2',
+		head_title = '%s - %s' % (re.sub(r'<[^>]+>', '', title), t('app_name')), title = title,
+		notice = notice, content_template = content_template, **kwargs)
+
+def render_text(text):
+	return Response(text, mimetype = 'text/plain')
+
+def send_bytes_as_attachment(bytes, filename):
+	return send_file(io.BytesIO(bytes), mimetype = 'application/octet-stream',
+		as_attachment = True, attachment_filename = filename)
+
+class Conditions:
+	def __init__(self):
+		for k, v in converted_form_attrs_items(request.args):
+			if k not in {'subaction', 'page'}: setattr(self, k, v)
+	def __getattr__(self, name): return None
+
+class Pages:
+	def __init__(self, pagination):
+		self.prev = pagination.prev_num
+		self.next = pagination.next_num
+		self.current = pagination.page
+		self.nums = pagination.iter_pages(left_current = 2, right_current = 2)
+	def __iter__(self): return self.nums
+
+# return (rows, pages)
+def paginate(query):
+	pagination = query.paginate(page = int(request.args.get('page', 1)),
+		per_page = get_setting().records_per_page)
+	return pagination.items, Pages(pagination)
+
+@main.route('/')
+def index():
+	return redirect(get_default_url_after_login())
+
+@main.route('/settings/<int:id>')
+def settings_show(id):
+	obj = Setting.load()
+	return render(obj = obj)
+@main.route('/settings/<int:id>/edit')
+def settings_edit(id):
+	obj = Setting.load()
+	return render(obj = obj)
+@main.route('/settings/<int:id>/update', methods = ['POST'])
+def settings_update(id):
+	obj = Setting.load()
+	permitted_attrs = get_permitted_form_attrs(obj)
+	is_invalid_number = False
+	for k, v in permitted_attrs.items():
+		if type((getattr(obj, k))) is int and v == '':
+			obj.errors.append([k, t('errors.invalid_number')])
+			is_invalid_number = True
+
+	if not is_invalid_number and obj.update_attrs(permitted_attrs):
+		load_setting()
+		flash_action_success()
+		g.ensure_multi_login_disabled = obj.multi_login_disabled
+		return redirect(url_for_show(obj))
+	else:
+		flash_action_failure(); return render('edit', obj = obj)
+
+@main.route('/account/login', methods = ['GET', 'POST'])
+def account_login():
+	try:
+		def check_login_fail_count():
+			f_count = ((obj.login_failed_count + 1) % (int(get_setting().max_login_fail_count)))
+			if f_count != 0:
+				obj.update_attrs({'login_failed_count': f_count})
+				raise OSError(errno.EINVAL, 'Incorrect password')
+			else:
+				obj.update_attrs({'login_failed_at': datetime.datetime.now(), 'login_failed_count': f_count})
+				raise OSError(errno.EINVAL, 'Login Lock')
+
+		if request.method == 'GET': obj = Admin()
+		else:
+			form = request.form
+			user_name = form['name']
+			ip = get_ipaddress(request)
+			user = User.query.filter_by(name=user_name).one_or_none()
+			if not user: raise OSError(errno.EINVAL, 'No user')
+			obj = Admin.query.options(joinedload('user')).filter_by(user_id=user.id).one_or_none()
+			if not obj: raise OSError(errno.EINVAL, 'No admin')
+			if obj.login_failed_at is not None:
+				t_check = (datetime.datetime.now() - obj.login_failed_at).total_seconds()
+				if t_check < (int(get_setting().account_inactivate_time)): raise OSError(errno.ECONNREFUSED, 'Disable login')
+			if not obj.user.is_password_correct(form['password']): check_login_fail_count()
+			else:
+				if not ip_addr_check(obj, request): raise OSError(errno.EACCES, 'Access denied')
+				if is_password_expired(obj.user):
+					session['change_password_admin_id'] = obj.id
+					return redirect(url_for('.account_edit'))
+			after_login(obj)
+			obj.update_attrs({'login_failed_at': None, 'login_failed_count': 0})
+			return redirect(get_url_after_login())
+		return render(obj = obj)
+	except Exception as e:
+		print(e)
+		if isinstance(e, OSError) and e.errno == errno.EINVAL:
+			flash_failure(t('account_wrong')); return render(obj=Admin())
+		elif isinstance(e, OSError) and e.errno == errno.EACCES:
+			flash_failure(t('access_denied')); return redirect(url_for('.account_login'))
+		elif isinstance(e, OSError) and e.errno == errno.ECONNREFUSED:
+			flash(t('can_not_login', x_seconds=get_setting().account_inactivate_time), 'failure')
+			return redirect(url_for('.account_login'))
+		elif isinstance(e, OSError) and e.errno == errno.ENODEV:
+			flash_failure(t('access_denied')); return redirect(url_for('.account_login'))
+		elif isinstance(e, OSError) and e.errno == errno.EPERM:
+			flash_failure(t('errors.not_primary_ip'))
+			return redirect(url_for('.account_login'))
+		elif isinstance(e, (KeyError, IndexError, TypeError, ValueError)):
+			# traceback.print_exc()
+			abort(HTTP_BAD_REQUEST)
+@main.route('/account/edit')
+def account_edit():
+	obj = g.current_admin
+	return render(obj = obj, change_password_guide = 'change_password_guide')
+@main.route('/account/update', methods = ['POST'])
+def account_update():
+	obj = Admin.query.options(joinedload('user')).get(session['change_password_admin_id'])
+	form = request.form
+	ip = get_ipaddress(request)
+	attrs = {'password': form['password'], 'password_confirmation': form['password_confirmation'], 'password_changed_at': datetime.datetime.now()}
+	if form['password'] and obj.user.update_attrs(attrs):
+		after_login(g.current_admin)
+		obj.update_attrs({'login_failed_at': None, 'login_failed_count': 0})
+		session['change_password_admin_id'] = None
+		return redirect(get_url_after_login())
+	else:
+		flash_action_failure()
+		return render('edit', obj = obj.user)
+
+@main.route('/account/logout', methods = ['POST'])
+def account_logout():
+	after_logout()
+	return redirect(url_for('.index'))
+
+# This should be called inside app.py
+def init_app(app):
+	appm_funcs = [yes_no,
+		can_index, can_create, can_update, can_bulkupdate, can_destroy,
+		url_for_index, url_for_new, url_for_show, url_for_edit, url_for_destroy,
+		Conditions, FormFor,
+		link_to_index, link_to_show, link_to_new, link_to_edit, link_to_destroy, page_links,
+		get_action_desc, get_attr_desc, get_action_confirm_desc,
+	]
+	jinja_globals = app.jinja_env.globals
+	for func in appm_funcs + [getattr(tag, k) for k in tag.__all__] + \
+		[len, Markup, escape, t, t_raw, l, get_locale, get_locales, datetime.datetime.date, datetime.datetime]:
+		jinja_globals[func.__name__] = func
+	jinja_globals.update(MODEL_BY_NAME)
